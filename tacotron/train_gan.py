@@ -20,7 +20,9 @@ import numpy as np
 from prepro import *
 #from prepro import load_vocab
 import tensorflow as tf
-from utils import shift_by_one
+from utils import shift_by_one, restore_shape, spectrogram2wav
+from tensorflow.python.client import timeline
+from scipy.io.wavfile import write
 
 
 class Graph:
@@ -40,19 +42,30 @@ class Graph:
             
             with tf.variable_scope("Generator"):
                 # Encoder
-                self.memory_gen = encode(self.x, is_training=is_training) # (N, T, E)
+                self.memory_gen = encode(self.q, is_training=is_training) # (N, T, E)
                 
                 # Decoder 
-                self.outputs1_gen = decode1(self.decoder_inputs, 
-                                         self.memory_gen,
-                                         is_training=is_training) # (N, T', hp.n_mels*hp.r)
-                self.outputs2_gen = decode2(self.outputs1_gen, is_training=is_training) # (N, T', (1+hp.n_fft//2)*hp.r)
-                print(self.outputs1_gen.shape)
+                decode_length = 50
+                self._outputs1_gen = tf.zeros([hp.batch_size,1,hp.n_mels*hp.r])
+                outputs1_gen_list = []
+                for j in range(decode_length):
+                    if j == 0:
+                        reuse = None
+                    else: 
+                        reuse = True
+                    self._outputs1_gen = decode1(self._outputs1_gen,
+                                            self.memory_gen,
+                                            is_training=is_training,reuse=reuse)
+                    outputs1_gen_list.append(self._outputs1_gen)
+                self.outputs1_gen = tf.concat(outputs1_gen_list,1)
+                self.outputs2_gen = decode2(self.outputs1_gen,is_training=is_training)
+
+                # self.outputs1_gen = decode1_gan(self.memory_gen,is_training=is_training)
+                # self.outputs2_gen = decode2(self.outputs1_gen,is_training=is_training)
 
             with tf.variable_scope("Discriminator"):
-                print(self.y.shape)
-                self.final_state_real = encode_dis(self.y, is_training=is_training)
-                self.final_state_fake = encode_dis(self.outputs1_gen, is_training=is_training,reuse=True)
+                self.final_state_real = encode_dis(self.z, is_training=is_training)
+                self.final_state_fake = encode_dis(self.outputs2_gen, is_training=is_training,reuse=True)
 
 
 
@@ -110,9 +123,12 @@ class Graph:
                 grad_g_clipped ,_= tf.clip_by_global_norm(grad_g,5.)
                 self.train_op_dis=self.optimizer.apply_gradients(zip(grad_d_clipped,var_d))
                 self.train_op_gen=self.optimizer.apply_gradients(zip(grad_g_clipped,var_g))
-
                 # self.train_op_dis = self.optimizer.minimize(self.dis_loss, global_step=self.global_step,var_list=dvars)
                 # self.train_op_gen = self.optimizer.minimize(self.gen_loss, global_step=self.global_step,var_list=gvars)
+
+                # Profiling
+                options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+                run_metadata = tf.RunMetadata()
 
                 # Summmary 
                 tf.summary.scalar('dis_loss_real', self.dis_loss_real)
@@ -142,18 +158,53 @@ def main():
         # Training 
         sv = tf.train.Supervisor(logdir=hp.logdir,
                                  save_model_secs=0)
-        #gpu_options = tf.GPUOptions(allow_growth=True)
-        with sv.managed_session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
+        options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        gpu_options = tf.GPUOptions(allow_growth=True)
+        run_metadata = tf.RunMetadata()
+        config = tf.ConfigProto(allow_soft_placement=True,gpu_options=gpu_options)
+        with sv.managed_session(config=config) as sess:
             print('made it to training')
-            sess.run(g.train_op_gen)
             for epoch in tqdm(range(1, hp.num_epochs+1)): 
                 if sv.should_stop(): 
                     print("Something is broken");break
-                print('Maybe okay')
+
+                # Sampling Audio
+                if epoch % hp.audio_summary == 1:
+                    print("Sampling")
+                    mname = 'gan'
+                    og,act,gen = sess.run([g.q,g.z,g.outputs2_gen])
+                    for i,(s0,s1,s2) in enumerate(zip(og,act,gen)):
+                        s0 = restore_shape(s0, hp.win_length//hp.hop_length, hp.r)
+                        s1 = restore_shape(s1, hp.win_length//hp.hop_length, hp.r)
+                        s2 = restore_shape(s2, hp.win_length//hp.hop_length, hp.r)           
+                        # generate wav files
+                        if hp.use_log_magnitude:
+                            audio0 = spectrogram2wav(np.power(np.e, s0)**hp.power)
+                            audio1 = spectrogram2wav(np.power(np.e, s1)**hp.power)
+                            audio2 = spectrogram2wav(np.power(np.e, s2)**hp.power)
+                        else:
+                            s0 = np.where(s0 < 0, 0, s0)
+                            s1 = np.where(s1 < 0, 0, s1)
+                            s2 = np.where(s2 < 0, 0, s2)
+                            audio0 = spectrogram2wav(s0**hp.power)
+                            audio1 = spectrogram2wav(s1**hp.power)
+                            audio2 = spectrogram2wav(s2**hp.power)
+                        write(hp.outputdir + "/gan_{}_org.wav".format(i), hp.sr, audio0)
+                        write(hp.outputdir + "/gan_{}_act.wav".format(i), hp.sr, audio1)
+                        write(hp.outputdir + "/gan_{}_gen.wav".format(i), hp.sr, audio2)
+                
+
                 for step in tqdm(range(g.num_batch), total=g.num_batch, ncols=70, leave=False, unit='b'):
-                    sess.run(g.train_op_dis)
+                    sess.run(g.train_op_dis,options=options,run_metadata=run_metadata)
                     for _ in range(hp.k):
-                        sess.run(g.train_op_gen)
+                        sess.run(g.train_op_gen,options=options,run_metadata=run_metadata)
+
+                    #Profile Logging
+                    fetched_timeline = timeline.Timeline(run_metadata.step_stats)
+                    chrome_trace = fetched_timeline.generate_chrome_trace_format()
+                    with open('timeline/timeline_01_step_%d.json' % step, 'w') as f:
+                        f.write(chrome_trace)
+
                 
                 # Write checkpoint files at every epoch
                 gs = sess.run(g.global_step) 

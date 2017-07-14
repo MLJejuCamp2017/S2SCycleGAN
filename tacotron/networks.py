@@ -65,7 +65,7 @@ def encode_dis(inputs, is_training=True, scope="encoder_dis", reuse=None):
         ## Disciriminator output
         memory = memory[:,-1,:]
         memory=normalize(memory,reuse=reuse)
-        W_dis = tf.get_variable("weights",shape=[hp.n_mels,1])
+        W_dis = tf.get_variable("weights",shape=[hp.embed_size,1])
         b_dis = tf.get_variable("bias",shape=[1])
         memory = tf.sigmoid(tf.matmul(memory,W_dis)+b_dis)
     
@@ -164,6 +164,7 @@ def decode1(decoder_inputs, memory, is_training=True, scope="decoder1", reuse=No
         outputs = tf.layers.dense(dec, out_dim) 
     
     return outputs
+    
 
 def decode2(inputs, is_training=True, scope="decoder2", reuse=None):
     '''
@@ -200,7 +201,7 @@ def decode2(inputs, is_training=True, scope="decoder2", reuse=None):
         dec += prenet_out
          
         ## Highway Nets
-        for i in range(4):
+        for i in range(hp.num_highwaynet_blocks):
             dec = highwaynet(dec, num_units=hp.embed_size//2, 
                                  scope='highwaynet_{}'.format(i)) # (N, T, E/2)
          
